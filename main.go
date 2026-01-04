@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -18,8 +19,8 @@ const (
 
 	PageSize      = 4096
 	TableMaxPages = 100
-	RowsPerSize   = PageSize / RowSize
-	TableMaxRows  = RowsPerSize * TableMaxPages
+	RowsPerPage   = PageSize / RowSize
+	TableMaxRows  = RowsPerPage * TableMaxPages
 )
 
 type Row struct {
@@ -28,9 +29,15 @@ type Row struct {
 	Email    [EmailSize]byte
 }
 
+type Pager struct {
+	File       *os.File
+	FileLength int64
+	Pages      [TableMaxPages][]byte
+}
+
 type Table struct {
 	NumRows uint32
-	Pages   [TableMaxPages][]byte
+	Pager   *Pager
 }
 
 type MetaCommandResult int
@@ -67,16 +74,97 @@ const (
 	ExecuteTableFull
 )
 
-func printPrompt() {
-	fmt.Print("chibidb > ")
+// -------------- Pager Implements ------------------
+func NewPager(filename string) *Pager {
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		fmt.Println("Error opening DB file", err)
+		os.Exit(1)
+	}
+
+	stat, _ := file.Stat()
+	fileLength := stat.Size()
+
+	return &Pager{
+		File:       file,
+		FileLength: fileLength,
+	}
+}
+func (p *Pager) GetPage(pageNum int) []byte {
+	if pageNum > TableMaxPages {
+		fmt.Println("Page number out of bounds.")
+		os.Exit(1)
+	}
+
+	if p.Pages[pageNum] == nil {
+		page := make([]byte, PageSize)
+		numPages := int(p.FileLength / PageSize)
+
+		if p.FileLength%PageSize != 0 {
+			numPages += 1
+		}
+
+		if pageNum < numPages {
+			_, err := p.File.ReadAt(page, int64(pageNum*PageSize))
+			if err != nil && err != io.EOF {
+				fmt.Println("Error reading file:", err)
+				os.Exit(1)
+			}
+
+		}
+		p.Pages[pageNum] = page
+	}
+	return p.Pages[pageNum]
 }
 
-func doMetaCommand(input string) MetaCommandResult {
-	if input == ".exit" {
-		os.Exit(0)
+func (p *Pager) Flush(pageNum int, size int) {
+	if p.Pages[pageNum] == nil {
+		return
 	}
-	return MetaCommandUnrecognizedCommand
+
+	offset := int64(pageNum * PageSize)
+	_, err := p.File.WriteAt(p.Pages[pageNum][:size], offset)
+	if err != nil {
+		fmt.Println("Error writing to file.", err)
+		os.Exit(1)
+	}
 }
+
+// ----------- DB Connection ----------
+func DbOpen(filename string) *Table {
+	pager := NewPager(filename)
+	numRows := uint32(pager.FileLength / RowSize)
+
+	return &Table{
+		Pager:   pager,
+		NumRows: numRows,
+	}
+}
+
+func (t *Table) DbClose() {
+	pager := t.Pager
+	numFullPages := int(t.NumRows / RowsPerPage)
+
+	for i := 0; i < numFullPages; i++ {
+		if pager.Pages[i] != nil {
+			pager.Flush(i, PageSize)
+			pager.Pages[i] = nil
+		}
+	}
+
+	numAdditionalRows := t.NumRows % RowsPerPage
+	if numAdditionalRows > 0 {
+		pageNum := numFullPages
+		if pager.Pages[pageNum] != nil {
+			size := int(numAdditionalRows * RowSize)
+			pager.Flush(pageNum, size)
+			pager.Pages[pageNum] = nil
+		}
+	}
+	pager.File.Close()
+}
+
+// ---------- Row Logic --------
 
 func (r *Row) Serialize(dst []byte) {
 	buf := new(bytes.Buffer)
@@ -98,26 +186,23 @@ func Deserialize(src []byte) *Row {
 	return row
 }
 
-func NewTable() *Table {
-	return &Table{
-		NumRows: 0,
-	}
+func (t *Table) rowSlot(rowNum uint32) ([]byte, error) {
+	pageNum := int(rowNum / RowsPerPage)
+
+	page := t.Pager.GetPage(pageNum)
+	rowOffset := (rowNum % RowsPerPage) * RowSize
+
+	return page[rowOffset : rowOffset+RowSize], nil
 }
 
-func (t *Table) rowSlot(rowNum uint32) ([]byte, error) {
-	pageNum := rowNum / RowsPerSize
+// --------- front ---------
 
-	if pageNum >= TableMaxPages {
-		return nil, fmt.Errorf("page number out of bounds")
+func doMetaCommand(input string, table *Table) MetaCommandResult {
+	if input == ".exit" {
+		table.DbClose()
+		os.Exit(0)
 	}
-
-	if t.Pages[pageNum] == nil {
-		t.Pages[pageNum] = make([]byte, PageSize)
-	}
-
-	rowOffset := (rowNum % RowsPerSize) * RowSize
-
-	return t.Pages[pageNum][rowOffset : rowOffset+RowSize], nil
+	return MetaCommandUnrecognizedCommand
 }
 
 func prepareStatement(input string, statement *Statement) PrepareResult {
@@ -144,6 +229,7 @@ func prepareStatement(input string, statement *Statement) PrepareResult {
 	return PrepareUnrecognizedStatement
 }
 
+// --------- backend ---------
 func executeStatement(statement *Statement, table *Table) ExecuteResult {
 	switch statement.Type {
 	case StatementInsert:
@@ -167,12 +253,13 @@ func executeStatement(statement *Statement, table *Table) ExecuteResult {
 }
 
 func main() {
-	table := NewTable()
+	fileName := "chibidb.db"
+	table := DbOpen(fileName)
+
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
-		printPrompt()
-
+		fmt.Print("chibidb > ")
 		if !scanner.Scan() {
 			break
 		}
@@ -184,7 +271,7 @@ func main() {
 		}
 
 		if strings.HasPrefix(input, ".") {
-			switch doMetaCommand(input) {
+			switch doMetaCommand(input, table) {
 			case MetaCommandSuccess:
 				continue
 			case MetaCommandUnrecognizedCommand:
@@ -195,6 +282,9 @@ func main() {
 		var statement Statement
 		switch prepareStatement(input, &statement) {
 		case PrepareSuccess:
+		case PrepareSyntaxError:
+			fmt.Println("Syntax Error. Could not parse statement.")
+			continue
 		case PrepareUnrecognizedStatement:
 			fmt.Printf("Unrecognized keyword at start of '%s'\n", input)
 			continue
