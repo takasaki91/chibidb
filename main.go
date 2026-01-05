@@ -40,6 +40,12 @@ type Table struct {
 	Pager   *Pager
 }
 
+type Cursor struct {
+	Table      *Table
+	RowNum     uint32
+	EndOfTable bool
+}
+
 type MetaCommandResult int
 
 const (
@@ -186,13 +192,39 @@ func Deserialize(src []byte) *Row {
 	return row
 }
 
-func (t *Table) rowSlot(rowNum uint32) ([]byte, error) {
+func (t *Table) TableStart() *Cursor {
+	cursor := &Cursor{
+		Table:      t,
+		RowNum:     0,
+		EndOfTable: (t.NumRows == 0),
+	}
+	return cursor
+}
+
+func (t *Table) TableEnd() *Cursor {
+	cursor := &Cursor{
+		Table:      t,
+		RowNum:     t.NumRows,
+		EndOfTable: true,
+	}
+	return cursor
+}
+
+func (c *Cursor) Value() ([]byte, error) {
+	rowNum := c.RowNum
 	pageNum := int(rowNum / RowsPerPage)
 
-	page := t.Pager.GetPage(pageNum)
-	rowOffset := (rowNum % RowsPerPage) * RowSize
+	page := c.Table.Pager.GetPage(pageNum)
 
+	rowOffset := (rowNum % RowsPerPage) * RowSize
 	return page[rowOffset : rowOffset+RowSize], nil
+}
+
+func (c *Cursor) Advance() {
+	c.RowNum += 1
+	if c.RowNum >= c.Table.NumRows {
+		c.EndOfTable = true
+	}
 }
 
 // --------- front ---------
@@ -236,16 +268,19 @@ func executeStatement(statement *Statement, table *Table) ExecuteResult {
 		if table.NumRows >= TableMaxRows {
 			return ExecuteTableFull
 		}
-		rowSlot, _ := table.rowSlot(table.NumRows)
+		cursor := table.TableEnd()
+		rowSlot, _ := cursor.Value()
 		statement.RowToInsert.Serialize(rowSlot)
 		table.NumRows++
 		return ExecuteSuccess
 	case StatementSelect:
+		cursor := table.TableStart()
 		for i := uint32(0); i < table.NumRows; i++ {
-			rowSlot, _ := table.rowSlot(i)
+			rowSlot, _ := cursor.Value()
 			row := Deserialize(rowSlot)
 
 			fmt.Printf("(%d, %s, %s)\n", row.ID, strings.Trim(string(row.Username[:]), "\x00"), strings.Trim(string(row.Email[:]), "\x00"))
+			cursor.Advance()
 		}
 		return ExecuteSuccess
 	}
