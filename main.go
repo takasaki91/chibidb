@@ -14,13 +14,37 @@ const (
 	IdSize       = 4
 	UsernameSize = 32
 	EmailSize    = 255
-
-	RowSize = IdSize + UsernameSize + EmailSize
+	RowSize      = IdSize + UsernameSize + EmailSize
 
 	PageSize      = 4096
 	TableMaxPages = 100
 	RowsPerPage   = PageSize / RowSize
 	TableMaxRows  = RowsPerPage * TableMaxPages
+
+	NodeTypeSize          = 1
+	NodeTypeOffset        = 0
+	IsRootSize            = 1
+	IsRootOffset          = NodeTypeSize
+	ParentPointerSize     = 4
+	ParentPointerOffset   = IsRootOffset + IsRootSize
+	CommandNodeHeaderSize = NodeTypeSize + IsRootSize + ParentPointerSize
+
+	LeafNodeNumCellsSize   = 4
+	LeafNodeNumCellsOffset = CommandNodeHeaderSize
+	LeafNodeHeaderSize     = CommandNodeHeaderSize + LeafNodeNumCellsSize
+
+	LeafNodeKeySize       = 4
+	LeafNodeKeyOffset     = 0
+	LeafNodeValueSize     = RowSize
+	LeafNodeValueOffset   = LeafNodeKeyOffset + LeafNodeKeySize
+	LeafNodeCellSize      = LeafNodeKeySize + LeafNodeValueSize
+	LeafNodeSpaceForCells = PageSize - LeafNodeHeaderSize
+	LeafNodeMaxCells      = LeafNodeSpaceForCells / LeafNodeCellSize
+)
+
+const (
+	NodeTypeInternal = 0
+	NodeTypeLeaf     = 1
 )
 
 type Row struct {
@@ -36,13 +60,13 @@ type Pager struct {
 }
 
 type Table struct {
-	NumRows uint32
-	Pager   *Pager
+	Pager *Pager
 }
 
 type Cursor struct {
 	Table      *Table
-	RowNum     uint32
+	PageNum    int
+	CellNum    uint32
 	EndOfTable bool
 }
 
@@ -123,13 +147,13 @@ func (p *Pager) GetPage(pageNum int) []byte {
 	return p.Pages[pageNum]
 }
 
-func (p *Pager) Flush(pageNum int, size int) {
+func (p *Pager) Flush(pageNum int) {
 	if p.Pages[pageNum] == nil {
 		return
 	}
 
 	offset := int64(pageNum * PageSize)
-	_, err := p.File.WriteAt(p.Pages[pageNum][:size], offset)
+	_, err := p.File.WriteAt(p.Pages[pageNum], offset)
 	if err != nil {
 		fmt.Println("Error writing to file.", err)
 		os.Exit(1)
@@ -139,34 +163,27 @@ func (p *Pager) Flush(pageNum int, size int) {
 // ----------- DB Connection ----------
 func DbOpen(filename string) *Table {
 	pager := NewPager(filename)
-	numRows := uint32(pager.FileLength / RowSize)
+
+	if pager.FileLength == 0 {
+		pager.GetPage(0)
+		initializeLeadNode(pager.Pages[0])
+	}
 
 	return &Table{
-		Pager:   pager,
-		NumRows: numRows,
+		Pager: pager,
 	}
 }
 
 func (t *Table) DbClose() {
 	pager := t.Pager
-	numFullPages := int(t.NumRows / RowsPerPage)
 
-	for i := 0; i < numFullPages; i++ {
+	for i := 0; i < TableMaxPages; i++ {
 		if pager.Pages[i] != nil {
-			pager.Flush(i, PageSize)
+			pager.Flush(i)
 			pager.Pages[i] = nil
 		}
 	}
 
-	numAdditionalRows := t.NumRows % RowsPerPage
-	if numAdditionalRows > 0 {
-		pageNum := numFullPages
-		if pager.Pages[pageNum] != nil {
-			size := int(numAdditionalRows * RowSize)
-			pager.Flush(pageNum, size)
-			pager.Pages[pageNum] = nil
-		}
-	}
 	pager.File.Close()
 }
 
@@ -194,37 +211,92 @@ func Deserialize(src []byte) *Row {
 
 func (t *Table) TableStart() *Cursor {
 	cursor := &Cursor{
-		Table:      t,
-		RowNum:     0,
-		EndOfTable: (t.NumRows == 0),
+		Table:   t,
+		PageNum: 0,
+		CellNum: 0,
 	}
+	rootNode := t.Pager.GetPage(0)
+	numCells := leafNodeNumCells(rootNode)
+	cursor.EndOfTable = (numCells == 0)
+
 	return cursor
 }
 
 func (t *Table) TableEnd() *Cursor {
+	rootNode := t.Pager.GetPage(0)
+	numCells := leafNodeNumCells(rootNode)
 	cursor := &Cursor{
 		Table:      t,
-		RowNum:     t.NumRows,
+		PageNum:    0,
+		CellNum:    numCells,
 		EndOfTable: true,
 	}
 	return cursor
 }
 
 func (c *Cursor) Value() ([]byte, error) {
-	rowNum := c.RowNum
-	pageNum := int(rowNum / RowsPerPage)
+	page := c.Table.Pager.GetPage(c.PageNum)
 
-	page := c.Table.Pager.GetPage(pageNum)
-
-	rowOffset := (rowNum % RowsPerPage) * RowSize
-	return page[rowOffset : rowOffset+RowSize], nil
+	return leafNodeValue(page, c.CellNum), nil
 }
 
 func (c *Cursor) Advance() {
-	c.RowNum += 1
-	if c.RowNum >= c.Table.NumRows {
+	page := c.Table.Pager.GetPage(c.PageNum)
+	numCells := leafNodeNumCells(page)
+
+	c.CellNum += 1
+	if c.CellNum >= numCells {
 		c.EndOfTable = true
 	}
+}
+
+// ---------- Node Helper Methods ----------
+
+func leafNodeNumCells(node []byte) uint32 {
+	return binary.LittleEndian.Uint32(node[LeafNodeNumCellsOffset:])
+}
+
+func leafNodeSetNumCells(node []byte, numCells uint32) {
+	binary.LittleEndian.PutUint32(node[LeafNodeNumCellsOffset:], numCells)
+}
+
+func leafNodeCell(node []byte, cellNum uint32) []byte {
+	offset := LeafNodeHeaderSize + cellNum*uint32(LeafNodeCellSize)
+	return node[offset : offset+LeafNodeCellSize]
+}
+
+func leafNodeValue(node []byte, cellNum uint32) []byte {
+	cell := leafNodeCell(node, cellNum)
+	return cell[LeafNodeKeyOffset+LeafNodeKeySize:]
+}
+
+func initializeLeadNode(node []byte) {
+	leafNodeSetNumCells(node, 0)
+	// TODO 簡易版らしい
+}
+
+func leafNodeInsert(cursor *Cursor, key uint32, value *Row) {
+	node := cursor.Table.Pager.GetPage(cursor.PageNum)
+
+	numCells := leafNodeNumCells(node)
+	if numCells >= LeafNodeMaxCells {
+		fmt.Println("Need to implement splitting a leaf node")
+		os.Exit(1)
+	}
+
+	if cursor.CellNum < numCells {
+		for i := numCells; i > cursor.CellNum; i-- {
+			target := leafNodeCell(node, i)
+			source := leafNodeCell(node, i-1)
+			copy(target, source)
+		}
+	}
+
+	leafNodeSetNumCells(node, numCells+1)
+
+	cell := leafNodeCell(node, cursor.CellNum)
+	binary.LittleEndian.PutUint32(cell[LeafNodeKeyOffset:], key)
+	value.Serialize(leafNodeValue(node, cursor.CellNum))
 }
 
 // --------- front ---------
@@ -265,20 +337,19 @@ func prepareStatement(input string, statement *Statement) PrepareResult {
 func executeStatement(statement *Statement, table *Table) ExecuteResult {
 	switch statement.Type {
 	case StatementInsert:
-		if table.NumRows >= TableMaxRows {
+		node := table.Pager.GetPage(0)
+		numCells := leafNodeNumCells(node)
+		if numCells >= LeafNodeMaxCells {
 			return ExecuteTableFull
 		}
 		cursor := table.TableEnd()
-		rowSlot, _ := cursor.Value()
-		statement.RowToInsert.Serialize(rowSlot)
-		table.NumRows++
+		leafNodeInsert(cursor, statement.RowToInsert.ID, &statement.RowToInsert)
 		return ExecuteSuccess
 	case StatementSelect:
 		cursor := table.TableStart()
-		for i := uint32(0); i < table.NumRows; i++ {
+		for !cursor.EndOfTable {
 			rowSlot, _ := cursor.Value()
 			row := Deserialize(rowSlot)
-
 			fmt.Printf("(%d, %s, %s)\n", row.ID, strings.Trim(string(row.Username[:]), "\x00"), strings.Trim(string(row.Email[:]), "\x00"))
 			cursor.Advance()
 		}
