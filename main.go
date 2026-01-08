@@ -342,12 +342,42 @@ func leafNodeInsert(cursor *Cursor, key uint32, value *Row) {
 	value.Serialize(leafNodeValue(node, cursor.CellNum))
 }
 
+func printConstants() {
+	fmt.Printf("ROW_SIZE: %d\n", RowSize)
+	fmt.Printf("COMMON_NODE_HEADER_SIZE: %d\n", CommonNodeHeaderSize)
+	fmt.Printf("LEAF_NODE_HEADER_SIZE: %d\n", LeafNodeHeaderSize)
+	fmt.Printf("LEAF_NODE_CELL_SIZE: %d\n", LeafNodeCellSize)
+	fmt.Printf("LEAF_NODE_SPACE_FOR_SCALE: %d\n", LeafNodeSpaceForCells)
+	fmt.Printf("LEAF_NODE_MAX_CELLS: %d\n", LeafNodeMaxCells)
+}
+
+func printLeafNode(node []byte) {
+	numCells := leafNodeNumCells(node)
+	fmt.Printf("leaf (size %d)\n", numCells)
+
+	for i := uint32(0); i < numCells; i++ {
+		key := leafNodeKey(node, i)
+		fmt.Printf(" - %d\n", key)
+	}
+}
+
 // --------- front ---------
 
 func doMetaCommand(input string, table *Table) MetaCommandResult {
 	if input == ".exit" {
 		table.DbClose()
 		os.Exit(0)
+	}
+	if input == ".btree" {
+		fmt.Println("Tree:")
+		node := table.Pager.GetPage(0)
+		printLeafNode(node)
+		return MetaCommandSuccess
+	}
+	if input == ".constants" {
+		fmt.Println("Constants:")
+		printConstants()
+		return MetaCommandSuccess
 	}
 	return MetaCommandUnrecognizedCommand
 }
