@@ -21,17 +21,17 @@ const (
 	RowsPerPage   = PageSize / RowSize
 	TableMaxRows  = RowsPerPage * TableMaxPages
 
-	NodeTypeSize          = 1
-	NodeTypeOffset        = 0
-	IsRootSize            = 1
-	IsRootOffset          = NodeTypeSize
-	ParentPointerSize     = 4
-	ParentPointerOffset   = IsRootOffset + IsRootSize
-	CommandNodeHeaderSize = NodeTypeSize + IsRootSize + ParentPointerSize
+	NodeTypeSize         = 1
+	NodeTypeOffset       = 0
+	IsRootSize           = 1
+	IsRootOffset         = NodeTypeSize
+	ParentPointerSize    = 4
+	ParentPointerOffset  = IsRootOffset + IsRootSize
+	CommonNodeHeaderSize = NodeTypeSize + IsRootSize + ParentPointerSize
 
 	LeafNodeNumCellsSize   = 4
-	LeafNodeNumCellsOffset = CommandNodeHeaderSize
-	LeafNodeHeaderSize     = CommandNodeHeaderSize + LeafNodeNumCellsSize
+	LeafNodeNumCellsOffset = CommonNodeHeaderSize
+	LeafNodeHeaderSize     = CommonNodeHeaderSize + LeafNodeNumCellsSize
 
 	LeafNodeKeySize       = 4
 	LeafNodeKeyOffset     = 0
@@ -102,6 +102,7 @@ type ExecuteResult int
 const (
 	ExecuteSuccess ExecuteResult = iota
 	ExecuteTableFull
+	ExecuteDuplicateKey
 )
 
 // -------------- Pager Implements ------------------
@@ -209,6 +210,8 @@ func Deserialize(src []byte) *Row {
 	return row
 }
 
+// ---------- Cursor Logic ----------
+
 func (t *Table) TableStart() *Cursor {
 	cursor := &Cursor{
 		Table:   t,
@@ -234,6 +237,41 @@ func (t *Table) TableEnd() *Cursor {
 	return cursor
 }
 
+func (t *Table) leafNodeFind(pageNum int, key uint32) *Cursor {
+	node := t.Pager.GetPage(pageNum)
+	numCells := leafNodeNumCells(node)
+
+	cursor := &Cursor{
+		Table:   t,
+		PageNum: pageNum,
+	}
+	min := uint32(0)
+	max := numCells
+
+	for min != max {
+		index := (min + max) / 2
+		keyAtIndex := leafNodeKey(node, index)
+		if key == keyAtIndex {
+			cursor.CellNum = index
+			return cursor
+		}
+		if key < keyAtIndex {
+			max = index
+		} else {
+			min = index + 1
+		}
+	}
+	cursor.CellNum = min
+	return cursor
+}
+func (t *Table) tableFind(key uint32) *Cursor {
+	rootPageNum := 0
+	// rootNode := t.Pager.GetPage(rootPageNum)
+
+	// if getNodeType(rootNode) == NodeTypeLeaf {.....}
+
+	return t.leafNodeFind(rootPageNum, key)
+}
 func (c *Cursor) Value() ([]byte, error) {
 	page := c.Table.Pager.GetPage(c.PageNum)
 
@@ -263,6 +301,11 @@ func leafNodeSetNumCells(node []byte, numCells uint32) {
 func leafNodeCell(node []byte, cellNum uint32) []byte {
 	offset := LeafNodeHeaderSize + cellNum*uint32(LeafNodeCellSize)
 	return node[offset : offset+LeafNodeCellSize]
+}
+
+func leafNodeKey(node []byte, cellNum uint32) uint32 {
+	cell := leafNodeCell(node, cellNum)
+	return binary.LittleEndian.Uint32(cell)
 }
 
 func leafNodeValue(node []byte, cellNum uint32) []byte {
@@ -342,7 +385,17 @@ func executeStatement(statement *Statement, table *Table) ExecuteResult {
 		if numCells >= LeafNodeMaxCells {
 			return ExecuteTableFull
 		}
-		cursor := table.TableEnd()
+
+		key := statement.RowToInsert.ID
+
+		cursor := table.tableFind(key)
+
+		if cursor.CellNum < numCells {
+			keyAtIndex := leafNodeKey(node, cursor.CellNum)
+			if keyAtIndex == key {
+				return ExecuteDuplicateKey
+			}
+		}
 		leafNodeInsert(cursor, statement.RowToInsert.ID, &statement.RowToInsert)
 		return ExecuteSuccess
 	case StatementSelect:
@@ -401,6 +454,8 @@ func main() {
 			fmt.Println("Executed.")
 		case ExecuteTableFull:
 			fmt.Println("Error: Table Full")
+		case ExecuteDuplicateKey:
+			fmt.Println("Error: Duplicate key.")
 		}
 	}
 }
