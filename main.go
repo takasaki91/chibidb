@@ -446,12 +446,58 @@ func (c *Cursor) Value() ([]byte, error) {
 }
 
 func (c *Cursor) Advance() {
-	page := c.Table.Pager.GetPage(c.PageNum)
-	numCells := leafNodeNumCells(page)
-
+	node := c.Table.Pager.GetPage(c.PageNum)
 	c.CellNum += 1
-	if c.CellNum >= numCells {
-		c.EndOfTable = true
+
+	if c.CellNum < leafNodeNumCells(node) {
+		return
+	}
+
+	pageNum := c.PageNum
+
+	for {
+		if isNodeRoot(c.Table.Pager.GetPage(pageNum)) {
+			c.EndOfTable = true
+			return
+		}
+
+		parentPageNum := int(nodeParent(c.Table.Pager.GetPage(pageNum)))
+		parentNode := c.Table.Pager.GetPage(parentPageNum)
+		parentNumKeys := internalNodeNumKeys(parentNode)
+
+		childIdx := -1
+
+		for i := uint32(0); i < parentNumKeys; i++ {
+			if internalNodeChild(parentNode, i) == uint32(pageNum) {
+				childIdx = int(i)
+				break
+			}
+		}
+
+		if childIdx == -1 {
+			if internalNodeRightChild(parentNode) == uint32(pageNum) {
+				childIdx = int(parentNumKeys)
+			}
+		}
+
+		if childIdx == int(parentNumKeys) {
+			pageNum = parentPageNum
+			continue
+		}
+
+		nextChildIdx := childIdx + 1
+		nextPageNum := internalNodeChild(parentNode, uint32(nextChildIdx))
+
+		nextNode := c.Table.Pager.GetPage(int(nextPageNum))
+
+		for getNodeType(nextNode) == NodeTypeInternal {
+			nextPageNum = internalNodeChild(nextNode, 0)
+			nextNode = c.Table.Pager.GetPage(int(nextPageNum))
+		}
+
+		c.PageNum = int(nextPageNum)
+		c.CellNum = 0
+		return
 	}
 }
 
