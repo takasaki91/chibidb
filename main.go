@@ -50,7 +50,7 @@ const (
 	InternalNodeKeySize   = 4
 	InternalNodeChildSize = 4
 	InternalNodeCellSize  = InternalNodeChildSize + InternalNodeKeySize
-	InternalNodeMaxSize   = 512
+	InternalNodeMaxSize   = 3
 )
 
 const (
@@ -220,18 +220,46 @@ func (t *Table) createNewRoot(rightChildPageNum int) {
 	root := pager.GetPage(0)
 
 	rightChild := pager.GetPage(rightChildPageNum)
-
 	leftChildPageNum := pager.GetNewPageNum()
 	leftChild := pager.GetPage(leftChildPageNum)
-	copy(leftChild, root)
+
+	if getNodeType(root) == NodeTypeInternal {
+		initializeInternalNode(leftChild)
+		internalNodeSetNumKeys(leftChild, internalNodeNumKeys(root))
+		internalNodeSetRightChild(leftChild, internalNodeRightChild(root))
+
+		numKeys := internalNodeNumKeys(root)
+		for i := uint32(0); i < numKeys; i++ {
+			childPageNum := internalNodeChild(root, i)
+			internalNodeSetChild(leftChild, i, childPageNum)
+			internalNodeSetKey(leftChild, i, internalNodeKey(root, i))
+
+			child := pager.GetPage(int(childPageNum))
+			setNodeParent(child, uint32(leftChildPageNum))
+		}
+		rightChildOfLeft := pager.GetPage(int(internalNodeRightChild(root)))
+		setNodeParent(rightChildOfLeft, uint32(leftChildPageNum))
+	} else {
+		initializeLeafNode(leftChild)
+		leafNodeSetNumCells(leftChild, leafNodeNumCells(root))
+		copy(leftChild[LeafNodeHeaderSize:], root[LeafNodeHeaderSize:])
+	}
+
 	setNodeRoot(leftChild, false)
 
 	initializeInternalNode(root)
 	setNodeRoot(root, true)
 	internalNodeSetNumKeys(root, 1)
+
 	internalNodeSetChild(root, 0, uint32(leftChildPageNum))
 
-	rightChildKey := leafNodeKey(rightChild, 0)
+	var rightChildKey uint32
+	if getNodeType(rightChild) == NodeTypeLeaf {
+		rightChildKey = leafNodeKey(rightChild, 0)
+	} else {
+		rightChildKey = internalNodeKey(rightChild, 0)
+	}
+
 	internalNodeSetKey(root, 0, rightChildKey)
 	internalNodeSetRightChild(root, uint32(rightChildPageNum))
 
@@ -291,21 +319,103 @@ func (t *Table) leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) {
 func (t *Table) internalNodeInsert(node []byte, parentPageNum int, childPageNum uint32, oldMaxKey uint32, newKey uint32) {
 	numKeys := internalNodeNumKeys(node)
 	if numKeys >= InternalNodeMaxSize {
-		fmt.Println("Need to implement splitting internal node")
-		os.Exit(1)
+		t.internalNodeSplitAndInsert(node, childPageNum, newKey)
+		return
 	}
+
 	rightChildPageNum := internalNodeRightChild(node)
 
-	cursor := t.internalNodeFind(parentPageNum, oldMaxKey)
-	index := cursor.CellNum
+	/*
+		cursor := t.internalNodeFind(parentPageNum, oldMaxKey)
+		index := cursor.CellNum
 
+		internalNodeSetNumKeys(node, numKeys+1)
+		if numKeys > 0 && index < numKeys {
+			// TODO
+		}
+	*/
 	internalNodeSetNumKeys(node, numKeys+1)
-	if numKeys > 0 && index < numKeys {
-		// TODO
-	}
 	internalNodeSetChild(node, numKeys, rightChildPageNum)
 	internalNodeSetKey(node, numKeys, newKey)
 	internalNodeSetRightChild(node, childPageNum)
+}
+
+func (t *Table) internalNodeSplitAndInsert(node []byte, childPageNum uint32, newKey uint32) {
+	oldNode := node
+	newNodePageNum := t.Pager.GetNewPageNum()
+	newNode := t.Pager.GetPage(newNodePageNum)
+	initializeInternalNode(newNode)
+
+	setNodeParent(newNode, nodeParent(oldNode))
+
+	splitIndex := InternalNodeMaxSize / 2
+
+	currentNodeIndex := uint32(0)
+
+	for i := uint32(splitIndex + 1); i < InternalNodeMaxSize; i++ {
+		key := internalNodeKey(oldNode, uint32(i))
+		child := internalNodeChild(oldNode, uint32(i))
+
+		internalNodeSetChild(newNode, currentNodeIndex, child)
+		internalNodeSetKey(newNode, currentNodeIndex, key)
+
+		childNode := t.Pager.GetPage(int(child))
+		setNodeParent(childNode, uint32(newNodePageNum))
+
+		currentNodeIndex++
+	}
+
+	oldRightChild := internalNodeRightChild(oldNode)
+	internalNodeSetChild(newNode, currentNodeIndex, oldRightChild)
+
+	oldRightChildNode := t.Pager.GetPage(int(oldRightChild))
+	setNodeParent(oldRightChildNode, uint32(newNodePageNum))
+
+	internalNodeSetKey(newNode, currentNodeIndex, newKey)
+	internalNodeSetRightChild(newNode, childPageNum)
+
+	childNode := t.Pager.GetPage(int(childPageNum))
+	setNodeParent(childNode, uint32(newNodePageNum))
+
+	internalNodeSetNumKeys(newNode, currentNodeIndex+1)
+
+	middleKey := internalNodeKey(oldNode, uint32(splitIndex))
+
+	childLeftOfMiddle := internalNodeChild(oldNode, uint32(splitIndex))
+	internalNodeSetNumKeys(oldNode, uint32(splitIndex))
+	internalNodeSetRightChild(oldNode, childLeftOfMiddle)
+
+	if isNodeRoot(oldNode) {
+		leftChildPageNum := t.Pager.GetNewPageNum()
+		leftChild := t.Pager.GetPage(leftChildPageNum)
+
+		copy(leftChild, oldNode)
+		setNodeRoot(leftChild, false)
+
+		numKeysLeft := internalNodeNumKeys(leftChild)
+		for i := uint32(0); i < numKeysLeft; i++ {
+			child := t.Pager.GetPage(int(internalNodeChild(leftChild, i)))
+			setNodeParent(child, uint32(leftChildPageNum))
+		}
+
+		rightChildOfLeft := t.Pager.GetPage(int(internalNodeRightChild(leftChild)))
+		setNodeParent(rightChildOfLeft, uint32(leftChildPageNum))
+
+		initializeInternalNode(oldNode)
+		setNodeRoot(oldNode, true)
+		internalNodeSetNumKeys(oldNode, 1)
+		internalNodeSetChild(oldNode, 0, uint32(leftChildPageNum))
+		internalNodeSetKey(oldNode, 0, middleKey)
+		internalNodeSetRightChild(oldNode, uint32(newNodePageNum))
+
+		setNodeParent(leftChild, 0)
+		setNodeParent(newNode, 0)
+	} else {
+		parentPageNum := int(nodeParent(oldNode))
+		parent := t.Pager.GetPage(parentPageNum)
+
+		t.internalNodeInsert(parent, parentPageNum, uint32(newNodePageNum), 0, middleKey)
+	}
 }
 
 func copyCell(src []byte, srcIndex uint32, dst []byte, dstIndex uint32) {
